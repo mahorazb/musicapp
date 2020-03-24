@@ -4,24 +4,56 @@ import 'package:MusicApp/models/audio_model.dart';
 import 'package:MusicApp/models/playlist_model.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_exoplayer/audioplayer.dart';
 import 'package:html_character_entities/html_character_entities.dart';
 
 class AudioPage extends StatefulWidget {
   final Playlist playlist;
+  final AudioPlayer player;
+  final Audio current;
+  final PageController myPage;
 
-  AudioPage({this.playlist});
+  AudioPage({this.myPage, this.playlist, this.player, this.current});
 
   @override
   _AudioPageState createState() => _AudioPageState();
 }
 
-class _AudioPageState extends State<AudioPage> {
-  var _current = 0;
+class _AudioPageState extends State<AudioPage>
+    with SingleTickerProviderStateMixin {
+  Audio _current;
   Playlist playlist;
   bool dark = true;
 
+  AnimationController controller;
+  Animation animation;
+  PlayerState playerState;
+
+  get isPlaying => playerState == PlayerState.PLAYING;
+  get isPaused => playerState == PlayerState.PAUSED;
+
+  @override
+  void initState() {
+    controller = AnimationController(
+        duration: const Duration(milliseconds: 250), vsync: this);
+    animation = CurvedAnimation(parent: controller, curve: Curves.easeIn);
+    new Future.delayed(
+      Duration(milliseconds: 250),
+      () => controller.forward(),
+    );
+    super.initState();
+  }
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
+    _current = widget.current;
+    playerState = widget.player.state;
     playlist = widget.playlist;
 
     return Scaffold(
@@ -33,51 +65,21 @@ class _AudioPageState extends State<AudioPage> {
             physics: BouncingScrollPhysics(),
             child: Stack(
               children: <Widget>[
-                Align(
-                  alignment: Alignment.center,
-                  child: Column(
-                    children: <Widget>[
-                      SizedBox(height: 45,),
-                      Container(
-                        width: MediaQuery.of(context).size.width * 0.40,
-                        height: MediaQuery.of(context).size.width * 0.40,
-                        decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.7),
-                          image: DecorationImage(
-                            image: playlist.imageURL != null
-                                ? NetworkImage(playlist.imageURL)
-                                : playlist.audios[0].imageURL != null
-                                    ? NetworkImage(playlist.audios[0].imageURL)
-                                    : Container(
-                                        color: Colors.black12,
-                                        child: Center(
-                                            child: Icon(Icons.music_note,
-                                                color: dark
-                                                    ? Colors.white60
-                                                    : Colors.black45)),
-                                      ),
-                            fit: BoxFit.cover,
-                          ),
-                        ),
-                        child: BackdropFilter(
-                          filter: ImageFilter.blur(sigmaX: 30, sigmaY: 25),
-                          child: Container(
-                            color: Colors.black.withOpacity(0),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
                 Row(
                   children: <Widget>[
-                    IconButton(icon:  Icon(
-                      CupertinoIcons.back,
-                      size: 26,
-                      color: dark ? Colors.white : Colors.black,
-                    ), onPressed: (){
-                      Navigator.pop(context);
-                    }),
+                    IconButton(
+                        icon: Icon(
+                          CupertinoIcons.back,
+                          size: 26,
+                          color: dark ? Colors.white : Colors.black,
+                        ),
+                        onPressed: () {
+                          controller.reverse();
+                          widget.myPage.animateToPage(0,
+                              duration: Duration(milliseconds: 500),
+                              curve: Curves.fastLinearToSlowEaseIn);
+                          //Navigator.pop(context);
+                        }),
                   ],
                 ),
                 Column(
@@ -96,7 +98,7 @@ class _AudioPageState extends State<AudioPage> {
                       ),
                     ),*/
                     SizedBox(
-                      height: 45,
+                      height: 50,
                     ),
                     Container(
                       width: 150,
@@ -145,9 +147,12 @@ class _AudioPageState extends State<AudioPage> {
                         color: dark ? Colors.grey[600] : Colors.grey[700],
                       ),
                     ),
-                    SizedBox(height: 5,),
-                    Column(
-                      children: _buildAudiosList(),
+                    SizedBox(
+                      height: 5,
+                    ),
+                    FadeTransition(
+                      opacity: animation,
+                      child: Container(child: _buildAudiosList()),
                     ),
                   ],
                 ),
@@ -159,14 +164,16 @@ class _AudioPageState extends State<AudioPage> {
     );
   }
 
-  List<Widget> _buildAudiosList() {
-    List<Widget> widgets = List<Widget>();
-
-    for (int i = 0; i < playlist.audios.length; i++) {
-      widgets.add(_buildAudioTile(playlist.audios[i]));
-    }
-
-    return widgets;
+  Widget _buildAudiosList() {
+    return ListView.builder(
+      scrollDirection: Axis.vertical,
+      physics: BouncingScrollPhysics(),
+      shrinkWrap: true,
+      itemCount: playlist.audios.length,
+      itemBuilder: (context, i) {
+        return _buildAudioTile(playlist.audios[i]);
+      },
+    );
   }
 
   Widget _buildAudioTile(Audio audio) {
@@ -174,7 +181,8 @@ class _AudioPageState extends State<AudioPage> {
       onTap: () {},
       child: Container(
         decoration: BoxDecoration(
-          color: dark ? Colors.white.withOpacity(0) : Colors.white.withOpacity(0),
+          color:
+              dark ? Colors.white.withOpacity(0) : Colors.white.withOpacity(0),
           borderRadius: BorderRadius.circular(5),
         ),
         padding: EdgeInsets.only(right: 10, left: 10, top: 5, bottom: 5),
@@ -186,6 +194,10 @@ class _AudioPageState extends State<AudioPage> {
             Row(
               children: <Widget>[
                 Container(
+                  decoration: BoxDecoration(
+                    color: dark ? Colors.black : Colors.white,
+                    borderRadius: BorderRadius.circular(5.0),
+                  ),
                   height: 45,
                   width: 45,
                   child: Stack(

@@ -4,19 +4,23 @@ import 'dart:convert';
 import 'package:MusicApp/models/audio_model.dart';
 import 'package:MusicApp/models/playlist_model.dart';
 import 'package:MusicApp/screens/audio_screen.dart';
-import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_exoplayer/audioplayer.dart';
+import 'package:flutter_exoplayer/audio_notification.dart';
+import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:pull_to_refresh/pull_to_refresh.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:html_character_entities/html_character_entities.dart';
+import 'package:rxdart/rxdart.dart';
 
 //const int playerID = 396433116;
 const int playerID = 157211115;
 bool showedTitle = true;
 bool dark = true;
 int overHound = 0;
+String status = 'hidden';
 
 void main() => runApp(MusicApp());
 
@@ -24,11 +28,11 @@ class MusicApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle(
- 
-       statusBarColor: dark ? Colors.black : Colors.white.withOpacity(0),
-       statusBarIconBrightness: dark ? Brightness.light : Brightness.dark,
-
-       
+      statusBarColor: dark ? Colors.black : Colors.white.withOpacity(0),
+      statusBarIconBrightness: dark ? Brightness.light : Brightness.dark,
+      systemNavigationBarColor: dark ? Colors.black : Colors.white,
+      systemNavigationBarIconBrightness:
+          dark ? Brightness.light : Brightness.dark,
     ));
     return GestureDetector(
       onTap: () {
@@ -52,8 +56,6 @@ class MusicApp extends StatelessWidget {
   }
 }
 
-enum PlayerState { stopped, playing, paused }
-
 class MyHomePage extends StatefulWidget {
   MyHomePage({Key key, this.title}) : super(key: key);
   final String title;
@@ -64,9 +66,16 @@ class MyHomePage extends StatefulWidget {
 
 class _MyHomePageState extends State<MyHomePage>
     with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  final GlobalKey<ScaffoldState> scaffoldKey = new GlobalKey<ScaffoldState>();
+  final GlobalKey<ScaffoldState> sliderKey = new GlobalKey<ScaffoldState>();
+
+  final _slider = PublishSubject<double>();
+  Stream<double> get sliderStream => _slider.stream;
+
   AnimationController controller;
   Animation<double> animation;
   TextEditingController editingController = TextEditingController();
+  PersistentBottomSheetController bottomSheetController;
 
   List<Audio> audios = new List<Audio>();
   List<Audio> loadedAudios = new List<Audio>();
@@ -74,14 +83,19 @@ class _MyHomePageState extends State<MyHomePage>
 
   bool loaded = false;
   bool updatePlaylist = true;
+  bool showPlayer = false;
   RefreshController _refreshController =
       RefreshController(initialRefresh: false);
+
+  bool changing = false;
+  double changeValue = 0.0;
 
   Audio _current;
 
   AudioPlayer audioPlayer;
-
-  PlayerState playerState = PlayerState.stopped;
+  double progress = 50.0;
+  double volume = 1.0;
+  PlayerState playerState = PlayerState.RELEASED;
 
   Duration duration;
   Duration position;
@@ -90,9 +104,15 @@ class _MyHomePageState extends State<MyHomePage>
   StreamSubscription _audioPlayerStateSubscription;
   StreamSubscription _playerCompleteSubscription;
   StreamSubscription _onPlayerError;
+  StreamSubscription _playerIndexSubscription;
+  StreamSubscription _onNotificationActionCallback;
+  StreamSubscription _onDurationChanged;
 
-  get isPlaying => playerState == PlayerState.playing;
-  get isPaused => playerState == PlayerState.paused;
+  PageController _myPage = PageController(initialPage: 0);
+  int playlistindex = 0;
+
+  get isPlaying => playerState == PlayerState.PLAYING;
+  get isPaused => playerState == PlayerState.PAUSED;
   //get _durationText => duration?.toString()?.split('.')?.first ?? '';
   //get _positionText => position?.toString()?.split('.')?.first ?? '';
 
@@ -101,6 +121,7 @@ class _MyHomePageState extends State<MyHomePage>
     super.initState();
     initAudioPlayer();
     getAudioList();
+    debugPrint('123');
     controller = AnimationController(
         duration: const Duration(milliseconds: 250), vsync: this);
     animation = CurvedAnimation(parent: controller, curve: Curves.easeIn);
@@ -108,82 +129,129 @@ class _MyHomePageState extends State<MyHomePage>
 
   @override
   void dispose() {
-    audioPlayer.stop();
     _positionSubscription.cancel();
     _audioPlayerStateSubscription.cancel();
     _playerCompleteSubscription.cancel();
     _onPlayerError.cancel();
+    _playerIndexSubscription.cancel();
+    _onNotificationActionCallback.cancel();
+    _onDurationChanged.cancel();
+    audioPlayer.release();
+    audioPlayer.dispose();
+    _slider.close();
     super.dispose();
   }
 
-  
-
   void initAudioPlayer() {
     audioPlayer = new AudioPlayer();
+    audioPlayer.release();
     _playerCompleteSubscription =
         audioPlayer.onPlayerCompletion.listen((event) {
-      onComplete();
-      setState(() {
-        position = duration;
-      });
+      position = duration;
+      debugPrint('1 complete');
     });
 
     _onPlayerError = audioPlayer.onPlayerError.listen((msg) {
       print('audioPlayer error : $msg');
       setState(() {
-        playerState = PlayerState.stopped;
+        playerState = PlayerState.STOPPED;
         duration = Duration(seconds: 0);
         position = Duration(seconds: 0);
       });
     });
 
-    _positionSubscription = audioPlayer.onAudioPositionChanged
-        .listen((p) => setState(() => position = p));
-    audioPlayer.onDurationChanged.listen((Duration d) {
+    _playerIndexSubscription =
+        audioPlayer.onCurrentAudioIndexChanged.listen((index) {
+      setState(() {});
+    });
+
+    _onNotificationActionCallback = audioPlayer.onNotificationActionCallback
+        .listen((notificationActionName) {
+      if (notificationActionName == NotificationActionName.NEXT) {
+        next();
+      } else if (notificationActionName == NotificationActionName.PREVIOUS) {
+        pervios();
+      } else if (notificationActionName == NotificationActionName.PAUSE) {
+        pause();
+      } else if (notificationActionName == NotificationActionName.PLAY) {
+        resume();
+      }
+
+      debugPrint('$notificationActionName');
+    });
+
+    _positionSubscription = audioPlayer.onAudioPositionChanged.listen((p) {
+      setState(() => position = p);
+
+      if (showPlayer) _slider.sink.add(position.inMilliseconds.toDouble());
+    });
+    _onDurationChanged = audioPlayer.onDurationChanged.listen((Duration d) {
       setState(() => duration = d);
     });
     _audioPlayerStateSubscription =
         audioPlayer.onPlayerStateChanged.listen((s) {
-      if (s == AudioPlayerState.PLAYING) {
-      } else if (s == AudioPlayerState.STOPPED) {
-        setState(() {
-          position = duration;
-        });
-      }
-    }, onError: (msg) {
       setState(() {
-        playerState = PlayerState.stopped;
-        duration = new Duration(seconds: 0);
-        position = new Duration(seconds: 0);
+        playerState = s;
+        print(playerState);
+        debugPrint('$volume');
       });
+
+      if (showPlayer) _slider.sink.add(position.inMilliseconds.toDouble());
+
+      if (s == PlayerState.RELEASED) {
+        audioPlayer.setVolume(volume);
+      } else if (s == PlayerState.COMPLETED) {
+        stop();
+        next();
+        debugPrint('2 complete');
+      }
     });
   }
 
-  Future play(String url) async {
-    await audioPlayer.play(url);
+  Future<void> play(String url) async {
+    //await audioPlayer.release();
+
+    await audioPlayer.play(
+      url,
+      repeatMode: false,
+      respectAudioFocus: true,
+      playerMode: PlayerMode.FOREGROUND,
+      audioNotification: AudioNotification(
+          smallIconFileName: 'appicon',
+          title: _current.title,
+          subTitle: _current.artist,
+          largeIconUrl: _current.imageURL != null
+              ? _current.imageURL
+              : 'images/giphy.gif',
+          isLocal: false,
+          notificationDefaultActions: NotificationDefaultActions.ALL,
+          notificationActionCallbackMode:
+              NotificationActionCallbackMode.CUSTOM),
+    );
 
     setState(() {
-      playerState = PlayerState.playing;
+      playerState = PlayerState.PLAYING;
     });
   }
 
-  Future pause() async {
+  Future<void> pause() async {
     await audioPlayer.pause();
-    setState(() => playerState = PlayerState.paused);
+    debugPrint('pause');
+    setState(() {});
+    if (showPlayer) _slider.sink.add(position.inMilliseconds.toDouble());
   }
 
-  Future stop() async {
+  Future<void> stop() async {
     await audioPlayer.stop();
     setState(() {
-      playerState = PlayerState.stopped;
       position = new Duration();
+      duration = new Duration();
     });
   }
 
-  Future next() async {
+  Future<void> next() async {
+    debugPrint('next');
     setState(() {
-      playerState = PlayerState.stopped;
-      position = new Duration();
       int index = audios.indexOf(_current);
       if (index < audios.length - 1) {
         _current = audios[index + 1];
@@ -193,9 +261,28 @@ class _MyHomePageState extends State<MyHomePage>
     await play(buildUrl(_current));
   }
 
-  void onComplete() {
-    setState(() => playerState = PlayerState.stopped);
-    next();
+  Future<void> pervios() async {
+    debugPrint('previ');
+    setState(() {
+      int index = audios.indexOf(_current);
+      if (index == 0) {
+        _current = audios[audios.length - 1];
+      } else
+        _current = audios[index - 1];
+    });
+    await play(buildUrl(_current));
+  }
+
+  Future<void> resume() async {
+    await audioPlayer.resume();
+    debugPrint('resumed');
+    setState(() {});
+    //setState(() => playerState = PlayerState.PLAYING);
+  }
+
+  Future<void> onComplete() async {
+    debugPrint('next');
+    await next();
   }
 
   Future<void> getAudioList() async {
@@ -206,8 +293,8 @@ class _MyHomePageState extends State<MyHomePage>
     });
 
     Audio.clear();
-    http.Response response;
 
+/*
     response = await http.get(
         'https://i1.kissvk.com/api/song/user/get_songs/$playerID?origin=kissvk.com&page=1&r=0.4');
 
@@ -227,16 +314,13 @@ class _MyHomePageState extends State<MyHomePage>
           parsedAudios2.map<Audio>((json) => Audio.fromJson(json)).toList());
       debugPrint('${Audio.temp}');
     }
+    */
 
-    if (updatePlaylist) {
-      await _getPlaylists();
-      updatePlaylist = false;
-    }
+    await _getPlaylists();
+    updatePlaylist = false;
 
     setState(() {
       loaded = true;
-      audios.clear();
-      audios.addAll(loadedAudios);
     });
   }
 
@@ -246,9 +330,22 @@ class _MyHomePageState extends State<MyHomePage>
     response = await http
         .get('https://brumobile.000webhostapp.com/getvk.php?id=$playerID');
     debugPrint('go');
-    List parsed = json.decode(response.body);
-    int i = 0;
 
+    List splits = response.body.split('%/&');
+
+    List jsonAudios = json.decode(splits[0]);
+    loadedAudios
+        .addAll(jsonAudios.map<Audio>((json) => Audio.fromJson(json)).toList());
+
+    setState(() {
+      audios.clear();
+      audios.addAll(loadedAudios);
+    });
+
+    playlists.clear();
+
+    List parsed = json.decode(splits[1]);
+    int i = 0;
     parsed.forEach((p) {
       Playlist plist = new Playlist(
         id: i,
@@ -257,7 +354,7 @@ class _MyHomePageState extends State<MyHomePage>
         imageURL: p['image'] as String,
       );
 
-      if(p['items'] != null) {
+      if (p['items'] != null) {
         p['items'].forEach((audio) {
           String id = audio['url'].split('=')[1].toString();
           var arr = audio['duration'].split(":");
@@ -272,7 +369,6 @@ class _MyHomePageState extends State<MyHomePage>
             duration: duration,
             imageURL: audio['image'] as String,
             url: audio['url'] as String,
-            site: 1,
           ));
         });
 
@@ -285,7 +381,7 @@ class _MyHomePageState extends State<MyHomePage>
   String buildUrl(Audio audio) {
     String val;
 
-    if (audio.site == 0) {
+    /* if (audio.site == 0) {
       if (audio.tempID <= overHound)
         val = 1.toString();
       else
@@ -306,13 +402,14 @@ class _MyHomePageState extends State<MyHomePage>
           _filterString(audio.title) +
           '&index=1';
     } else {
-      val = "https://music7s.org" + audio.url;
-    }
+   }*/
+
+    val = "https://music7s.org" + audio.url;
 
     return val;
   }
 
-  String _filterString(String string) {
+  /* String _filterString(String string) {
     return string
         .replaceAll('#', '-')
         .replaceAll('[', '-')
@@ -323,7 +420,7 @@ class _MyHomePageState extends State<MyHomePage>
         .replaceAll('&', '-')
         .replaceAll(';', '-');
   }
-
+*/
   void _onRefresh() async {
     await getAudioList();
     _refreshController.refreshCompleted();
@@ -358,265 +455,327 @@ class _MyHomePageState extends State<MyHomePage>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      key: scaffoldKey,
       backgroundColor: dark ? Colors.black : Colors.white,
-      body: SafeArea(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            Stack(
+      body: PageView(
+        controller: _myPage,
+        physics: NeverScrollableScrollPhysics(),
+        children: <Widget>[
+          SafeArea(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
                 Stack(
-                  //crossAxisAlignment: CrossAxisAlignment.start,
-                  //mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  //mainAxisSize: MainAxisSize.max,
                   children: <Widget>[
-                    showedTitle
-                        ? Padding(
-                            padding: const EdgeInsets.only(
-                                top: 5.0, left: 20, right: 15, bottom: 0),
-                            child: Column(
-                              children: <Widget>[
-                                Row(
-                                  mainAxisAlignment:
-                                      MainAxisAlignment.spaceBetween,
+                    Stack(
+                      //crossAxisAlignment: CrossAxisAlignment.start,
+                      //mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      //mainAxisSize: MainAxisSize.max,
+                      children: <Widget>[
+                        showedTitle
+                            ? Padding(
+                                padding: const EdgeInsets.only(
+                                    top: 5.0, left: 20, right: 15, bottom: 0),
+                                child: Column(
                                   children: <Widget>[
-                                    Text(
-                                      'Музыка',
-                                      style: TextStyle(
-                                        color:
-                                            dark ? Colors.white : Colors.black,
-                                        fontSize: 28,
-                                        fontWeight: FontWeight.w700,
-                                      ),
+                                    Row(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.spaceBetween,
+                                      children: <Widget>[
+                                        Text(
+                                          'Музыка',
+                                          style: TextStyle(
+                                            color: dark
+                                                ? Colors.white
+                                                : Colors.black,
+                                            fontSize: 28,
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                        ),
+                                      ],
                                     ),
                                   ],
                                 ),
-                              ],
-                            ),
-                          )
-                        : Container(),
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: Padding(
-                        padding: const EdgeInsets.only(
-                            top: 5.0, right: 20, left: 20, bottom: 5),
-                        child: AnimatedContainer(
-                          curve: Curves.easeIn,
-                          duration: Duration(milliseconds: 250),
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(5.0),
-                            color: !showedTitle
-                                ? dark ? Colors.grey[900] : Colors.grey[100]
-                                : dark ? Colors.black : Colors.white,
-                          ),
-                          padding: EdgeInsets.all(3),
-                          width: showedTitle
-                              ? 30
-                              : MediaQuery.of(context).size.width - 40,
-                          height: 30,
-                          child: TextFormField(
-                            showCursor: false,
-                            controller: editingController,
-                            onChanged: (value) {
-                              filterSearchResults(value);
-                            },
-                            onTap: () {
-                              setState(() {
-                                showedTitle = false;
-                              });
-                            },
-                            onEditingComplete: () {
-                              setState(() {
-                                showedTitle = true;
-                              });
-                              FocusScopeNode currentFocus =
-                                  FocusScope.of(context);
-
-                              if (!currentFocus.hasPrimaryFocus) {
-                                currentFocus.unfocus();
-                              }
-                            },
-                            decoration: InputDecoration(
-                              hoverColor: Colors.grey[800],
-                              fillColor: Colors.black,
-                              border: InputBorder.none,
-                              icon: Icon(
-                                Icons.search,
-                                color: Colors.grey[700],
+                              )
+                            : Container(),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: Padding(
+                            padding: const EdgeInsets.only(
+                                top: 5.0, right: 20, left: 20, bottom: 5),
+                            child: AnimatedContainer(
+                              curve: Curves.easeIn,
+                              duration: Duration(milliseconds: 250),
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(5.0),
+                                color: !showedTitle
+                                    ? dark ? Colors.grey[900] : Colors.grey[100]
+                                    : dark ? Colors.black : Colors.white,
                               ),
-                              alignLabelWithHint: true,
+                              padding: EdgeInsets.all(3),
+                              width: showedTitle
+                                  ? 30
+                                  : MediaQuery.of(context).size.width - 40,
+                              height: 30,
+                              child: TextFormField(
+                                showCursor: false,
+                                controller: editingController,
+                                onChanged: (value) {
+                                  filterSearchResults(value);
+                                },
+                                onTap: () {
+                                  setState(() {
+                                    showedTitle = false;
+                                  });
+                                },
+                                onEditingComplete: () {
+                                  setState(() {
+                                    showedTitle = true;
+                                  });
+                                  FocusScopeNode currentFocus =
+                                      FocusScope.of(context);
+
+                                  if (!currentFocus.hasPrimaryFocus) {
+                                    currentFocus.unfocus();
+                                  }
+                                },
+                                decoration: InputDecoration(
+                                  hoverColor: Colors.grey[800],
+                                  fillColor: Colors.black,
+                                  border: InputBorder.none,
+                                  icon: Icon(
+                                    Icons.search,
+                                    color: Colors.grey[700],
+                                  ),
+                                  alignLabelWithHint: true,
+                                ),
+                                cursorColor: Colors.black,
+                              ),
                             ),
-                            cursorColor: Colors.black,
                           ),
                         ),
-                      ),
+                        Align(
+                          alignment: Alignment.bottomCenter,
+                          child: Padding(
+                            padding:
+                                EdgeInsets.only(top: 46, left: 20, right: 20),
+                            child: Divider(
+                                height: 1, thickness: 0.2, color: Colors.grey),
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),
-              ],
-            ),
-            Expanded(
-              child: loaded
-                  ? Scrollbar(
-                      child: RefreshConfiguration(
-                        enableBallisticLoad: false,
-                        child: SmartRefresher(
-                          header: CustomHeader(
-                            builder:
-                                (BuildContext context, RefreshStatus mode) {
-                              Widget body;
-                              if (mode == RefreshStatus.idle) {
-                                body = Text(
-                                  "Тащите вниз что бы обновить",
-                                  style: TextStyle(
-                                    color: dark ? Colors.white : Colors.black,
-                                  ),
-                                );
-                              } else if (mode == RefreshStatus.refreshing) {
-                                body = CupertinoActivityIndicator(radius: 15,);
-                              } else if (mode == RefreshStatus.failed) {
-                                body = Text(
-                                  "Ошибка.",
-                                  style: TextStyle(
-                                    color: dark ? Colors.white : Colors.black,
-                                  ),
-                                );
-                              } else if (mode == RefreshStatus.canRefresh) {
-                                body = Text(
-                                  "Обновить",
-                                  style: TextStyle(
-                                    color: dark ? Colors.white : Colors.black,
-                                  ),
-                                );
-                              } else {
-                                body = Text(
-                                  "Обновлено",
-                                  style: TextStyle(
-                                    color: dark ? Colors.white : Colors.black,
-                                  ),
-                                );
-                              }
-                              return Container(
-                                height: 55.0,
-                                child: Center(child: body),
-                              );
-                            },
-                          ),
-                          enablePullUp: false,
-                          enablePullDown: true,
-                          physics: BouncingScrollPhysics(),
-                          onRefresh: _onRefresh,
-                          controller: _refreshController,
-                          scrollDirection: Axis.vertical,
-                          child: _buildAudiosList(),
-                        ),
-                      ),
-                    )
-                  : Container(
-                      child: Center(child: CircularProgressIndicator()),
-                    ),
-            ),
-          ],
-        ),
-      ),
-      bottomNavigationBar: _current != null
-          ? Container(
-              color: dark ? Colors.grey.withOpacity(0.1) : Colors.white,
-              height: 60,
-              child: Column(
-                children: <Widget>[
-                  Divider(
-                    color: dark
-                        ? Colors.grey.withOpacity(0.1)
-                        : Colors.grey.withOpacity(0.4),
-                    height: 1.0,
-                    thickness: 0.7,
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.only(
-                        left: 20, top: 5, bottom: 5, right: 10),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.max,
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: <Widget>[
-                        Row(
-                          children: <Widget>[
-                            FadeTransition(
-                              opacity: animation,
-                              child: Container(
-                                decoration: BoxDecoration(
-                                  color: Colors.black12,
-                                  borderRadius: BorderRadius.circular(5.0),
-                                ),
-                                width: 45,
-                                height: 45,
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(5.0),
-                                  child: _current.imageURL != null
-                                      ? Image.network(
-                                          _current.imageURL,
-                                          fit: BoxFit.cover,
-                                        )
-                                      : Container(
-                                          child: Center(
-                                              child: Icon(Icons.music_note,
-                                                  color: dark ? Colors.white : Colors.black45)),
-                                        ),
-                                ),
-                              ),
-                            ),
-                            SizedBox(
-                              width: 15,
-                            ),
-                            Column(
-                              mainAxisSize: MainAxisSize.max,
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: <Widget>[
-                                Container(
-                                  width:
-                                      MediaQuery.of(context).size.width * 0.45,
-                                  child: Text(
-                                    HtmlCharacterEntities.decode(
-                                        _current.title),
-                                    style: TextStyle(
+                Expanded(
+                  child: loaded
+                      ? Scrollbar(
+                          child: RefreshConfiguration(
+                            enableBallisticLoad: false,
+                            child: SmartRefresher(
+                              header: CustomHeader(
+                                builder:
+                                    (BuildContext context, RefreshStatus mode) {
+                                  Widget body;
+                                  if (mode == RefreshStatus.idle) {
+                                    body = Text(
+                                      "Тащите вниз что бы обновить",
+                                      style: TextStyle(
                                         color:
                                             dark ? Colors.white : Colors.black,
-                                        fontSize: 17.0,
-                                        fontWeight: FontWeight.w400),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                              ],
+                                      ),
+                                    );
+                                  } else if (mode == RefreshStatus.refreshing) {
+                                    body = CupertinoActivityIndicator(
+                                      radius: 15,
+                                    );
+                                  } else if (mode == RefreshStatus.failed) {
+                                    body = Text(
+                                      "Ошибка.",
+                                      style: TextStyle(
+                                        color:
+                                            dark ? Colors.white : Colors.black,
+                                      ),
+                                    );
+                                  } else if (mode == RefreshStatus.canRefresh) {
+                                    body = Text(
+                                      "Обновить",
+                                      style: TextStyle(
+                                        color:
+                                            dark ? Colors.white : Colors.black,
+                                      ),
+                                    );
+                                  } else {
+                                    body = Text(
+                                      "Обновлено",
+                                      style: TextStyle(
+                                        color:
+                                            dark ? Colors.white : Colors.black,
+                                      ),
+                                    );
+                                  }
+                                  return Container(
+                                    height: 55.0,
+                                    child: Center(child: body),
+                                  );
+                                },
+                              ),
+                              enablePullUp: false,
+                              enablePullDown: true,
+                              physics: BouncingScrollPhysics(),
+                              onRefresh: _onRefresh,
+                              controller: _refreshController,
+                              scrollDirection: Axis.vertical,
+                              child: _buildAudiosList(),
                             ),
-                          ],
+                          ),
+                        )
+                      : Container(
+                          child: Center(child: CircularProgressIndicator()),
                         ),
-                        Row(
-                          children: <Widget>[
-                            IconButton(
+                ),
+              ],
+            ),
+          ),
+          !playlists.isEmpty
+              ? AudioPage(
+                  myPage: _myPage,
+                  playlist: playlists[playlistindex],
+                  player: audioPlayer,
+                  current: _current,
+                )
+              : Container(),
+        ],
+      ),
+      bottomNavigationBar: _current != null
+          ? showPlayer
+              ? null
+              : GestureDetector(
+                  onTap: () {
+                    setState(() => showPlayer = true);
 
-                              icon: !isPlaying
-                                  ? Icon(Icons.play_arrow,
-                                      color: dark ? Colors.white : Colors.black)
-                                  : Icon(Icons.pause,
-                                      color:
-                                          dark ? Colors.white : Colors.black),
-                              onPressed: isPlaying
-                                  ? () => pause()
-                                  : () => play(buildUrl(_current)),
-                            ),
-                            IconButton(
-                              icon: Icon(Icons.fast_forward,
-                                  color: dark ? Colors.white : Colors.black),
-                              onPressed: () => next(),
-                            ),
-                          ],
+                    bottomSheetController = scaffoldKey.currentState
+                        .showBottomSheet(
+                            (BuildContext context) => _bottomSheetPlayer(),
+                            elevation: 0.0,
+                            backgroundColor: Colors.white.withOpacity(0));
+
+                    bottomSheetController.closed.then((value) {
+                      Future.delayed(Duration(milliseconds: 250),
+                          () => setState(() => showPlayer = false));
+                    });
+                  },
+                  child: Container(
+                    color: dark ? Colors.grey.withOpacity(0.1) : Colors.white,
+                    height: 60,
+                    child: Column(
+                      children: <Widget>[
+                        Divider(
+                          color: dark
+                              ? Colors.grey.withOpacity(0.1)
+                              : Colors.grey.withOpacity(0.4),
+                          height: 1.0,
+                          thickness: 0.7,
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.only(
+                              left: 20, top: 5, bottom: 5, right: 10),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.max,
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: <Widget>[
+                              Row(
+                                children: <Widget>[
+                                  FadeTransition(
+                                    opacity: animation,
+                                    child: Container(
+                                      decoration: BoxDecoration(
+                                        color: Colors.black12,
+                                        borderRadius:
+                                            BorderRadius.circular(5.0),
+                                      ),
+                                      width: 45,
+                                      height: 45,
+                                      child: ClipRRect(
+                                        borderRadius:
+                                            BorderRadius.circular(5.0),
+                                        child: _current.imageURL != null
+                                            ? Image.network(
+                                                _current.imageURL,
+                                                fit: BoxFit.cover,
+                                              )
+                                            : Container(
+                                                child: Center(
+                                                    child: Icon(
+                                                        Icons.music_note,
+                                                        color: dark
+                                                            ? Colors.white
+                                                            : Colors.black45)),
+                                              ),
+                                      ),
+                                    ),
+                                  ),
+                                  SizedBox(
+                                    width: 15,
+                                  ),
+                                  Column(
+                                    mainAxisSize: MainAxisSize.max,
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: <Widget>[
+                                      Container(
+                                        width:
+                                            MediaQuery.of(context).size.width *
+                                                0.45,
+                                        child: Text(
+                                          HtmlCharacterEntities.decode(
+                                              _current.title),
+                                          style: TextStyle(
+                                              color: dark
+                                                  ? Colors.white
+                                                  : Colors.black,
+                                              fontSize: 17.0,
+                                              fontWeight: FontWeight.w400),
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                              Row(
+                                children: <Widget>[
+                                  IconButton(
+                                      icon: !isPlaying
+                                          ? FaIcon(FontAwesomeIcons.play,
+                                              size: 18,
+                                              color: dark
+                                                  ? Colors.white
+                                                  : Colors.black)
+                                          : FaIcon(FontAwesomeIcons.pause,
+                                              size: 18,
+                                              color: dark
+                                                  ? Colors.white
+                                                  : Colors.black),
+                                      onPressed: isPlaying
+                                          ? () => pause()
+                                          : () => resume()),
+                                  IconButton(
+                                    icon: FaIcon(FontAwesomeIcons.forward,
+                                        size: 18,
+                                        color:
+                                            dark ? Colors.white : Colors.black),
+                                    onPressed: () => next(),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
                         ),
                       ],
                     ),
                   ),
-                ],
-              ),
-            )
+                )
           : Container(
               height: 0,
             ),
@@ -673,13 +832,21 @@ class _MyHomePageState extends State<MyHomePage>
         children: <Widget>[
           GestureDetector(
             onTap: () {
-              Navigator.push(
+              /* Navigator.push(
                 context,
                 MaterialPageRoute(
                     builder: (context) => AudioPage(
                           playlist: playlists[index],
+                          player: audioPlayer,
+                          current: _current,
                         )),
-              );
+              );*/
+              setState(() {
+                playlistindex = index;
+              });
+              _myPage.animateToPage(1,
+                  duration: Duration(milliseconds: 500),
+                  curve: Curves.fastLinearToSlowEaseIn);
             },
             child: Container(
               width: 125,
@@ -829,6 +996,250 @@ class _MyHomePageState extends State<MyHomePage>
     );
   }
 
+  Widget _bottomSheetPlayer() {
+    return SafeArea(
+      child: Container(
+        width: MediaQuery.of(context).size.width,
+        height: MediaQuery.of(context).size.height -
+            MediaQuery.of(context).padding.top -
+            46,
+        color: dark ? Colors.black : Colors.white,
+        child: StreamBuilder(
+          builder: (BuildContext context, AsyncSnapshot<double> snapshot) {
+            Duration upset = duration - position;
+            return Column(
+              mainAxisSize: MainAxisSize.max,
+              mainAxisAlignment: MainAxisAlignment.start,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: <Widget>[
+                IconButton(
+                  splashColor: Colors.grey.withOpacity(0.5),
+                  icon: FaIcon(
+                    FontAwesomeIcons.windowMinimize,
+                    size: 28,
+                    color: dark ? Colors.white : Colors.grey,
+                  ),
+                  onPressed: () {
+                    bottomSheetController.close();
+                  },
+                ),
+                Spacer(flex: 1),
+                Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(5.0),
+                    color: Colors.grey[800],
+                    boxShadow: [
+                      BoxShadow(
+                        blurRadius: 10.0,
+                        color: dark
+                            ? Colors.grey.withOpacity(.1)
+                            : Colors.black.withOpacity(.5),
+                        offset: Offset(0.0, 0.0),
+                      ),
+                      BoxShadow(
+                        blurRadius: 15.0,
+                        spreadRadius: 5,
+                        color: dark
+                            ? Colors.grey.withOpacity(.3)
+                            : Colors.black.withOpacity(.3),
+                        offset: Offset(0.0, 10.0),
+                      ),
+                    ],
+                  ),
+                  height: MediaQuery.of(context).size.height / 2.8,
+                  width: MediaQuery.of(context).size.height / 2.8,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(5.0),
+                    child: _current.imageURL != null
+                        ? Image.network(
+                            _current.imageURL,
+                            fit: BoxFit.cover,
+                          )
+                        : Center(
+                            child: Icon(Icons.music_note, size: 60),
+                          ),
+                  ),
+                ),
+                Spacer(flex: 1),
+                Container(
+                  width: MediaQuery.of(context).size.height / 2.5,
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      activeTrackColor: Colors.blue,
+                      inactiveTrackColor:
+                          dark ? Colors.grey[900] : Colors.grey[400],
+                      trackHeight: 1.0,
+                      thumbShape:
+                          RoundSliderThumbShape(enabledThumbRadius: 6.0),
+                      overlayColor: Colors.purple.withAlpha(32),
+                      overlayShape:
+                          RoundSliderOverlayShape(overlayRadius: 14.0),
+                    ),
+                    child: Slider(
+                      value: !changing
+                          ? snapshot.data == null ? 0.0 : snapshot.data
+                          : changeValue,
+                      onChanged: (value) async {
+                        await audioPlayer.seekPosition(
+                            Duration(milliseconds: value.toInt()));
+                      },
+                      min: 0.0,
+                      max: duration != null
+                          ? duration.inMilliseconds.toDouble() < 0.0
+                              ? 0.1
+                              : duration.inMilliseconds.toDouble()
+                          : 0.1,
+                    ),
+                  ),
+                ),
+                Container(
+                  width: MediaQuery.of(context).size.height / 2.7,
+                  child: Padding(
+                    padding: EdgeInsets.only(left: 0, right: 0),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: <Widget>[
+                        Text(
+                          '${position.inMinutes.remainder(60)}:${position.inSeconds.remainder(60).toString().padLeft(2, '0')}',
+                          style: TextStyle(color: Colors.grey[700]),
+                        ),
+                        Text(
+                          '-${upset.inMinutes.remainder(60)}:${upset.inSeconds.remainder(60).toString().padLeft(2, '0')}',
+                          style: TextStyle(color: Colors.grey[700]),
+                        )
+                      ],
+                    ),
+                  ),
+                ),
+                Spacer(flex: 1),
+                Container(
+                  child: Column(
+                      mainAxisSize: MainAxisSize.max,
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: <Widget>[
+                        Text(
+                          _current.title,
+                          style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            color: dark ? Colors.white : Colors.black,
+                          ),
+                          overflow: TextOverflow.fade,
+                          maxLines: 1,
+                          softWrap: false,
+                        ),
+                        Text(
+                          _current.artist,
+                          style: TextStyle(
+                            fontSize: 17,
+                            color: Colors.grey[500],
+                          ),
+                          overflow: TextOverflow.fade,
+                          maxLines: 1,
+                          softWrap: false,
+                        ),
+                      ]),
+                ),
+                Spacer(flex: 2),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceAround,
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: <Widget>[
+                    Spacer(flex: 2),
+                    IconButton(
+                        splashColor: Colors.grey.withOpacity(0.5),
+                        icon: Icon(Icons.shuffle,
+                            color: dark ? Colors.grey[700] : Colors.grey[700],
+                            size: 24),
+                        onPressed: () {}),
+                    Spacer(),
+                    IconButton(
+                        splashColor: Colors.grey.withOpacity(0.5),
+                        icon: FaIcon(FontAwesomeIcons.backward,
+                            color: dark ? Colors.white : Colors.grey[700],
+                            size: 24),
+                        onPressed: () => pervios()),
+                    Spacer(),
+                    IconButton(
+                        splashColor: Colors.grey,
+                        hoverColor: Colors.black,
+                        focusColor: Colors.black,
+                        highlightColor: Colors.green,
+                        icon: FaIcon(
+                            isPlaying
+                                ? FontAwesomeIcons.pause
+                                : FontAwesomeIcons.play,
+                            color: dark ? Colors.white : Colors.grey[700],
+                            size: 30),
+                        onPressed: () => isPlaying ? pause() : resume()),
+                    Spacer(),
+                    IconButton(
+                        splashColor: Colors.grey.withOpacity(0.5),
+                        icon: FaIcon(FontAwesomeIcons.forward,
+                            color: dark ? Colors.white : Colors.grey[700],
+                            size: 24),
+                        onPressed: () => next()),
+                    Spacer(),
+                    IconButton(
+                        splashColor: Colors.white,
+                        icon: Icon(Icons.replay,
+                            color: dark ? Colors.grey[700] : Colors.grey[700],
+                            size: 24),
+                        onPressed: () {}),
+                    Spacer(flex: 2),
+                  ],
+                ),
+                Spacer(flex: 2),
+                Row(
+                  children: <Widget>[
+                    Spacer(flex: 2),
+                    FaIcon(FontAwesomeIcons.volumeOff,
+                        color: dark ? Colors.white : Colors.grey[700],
+                        size: 19),
+                    Spacer(flex: 1),
+                    SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        activeTrackColor:
+                            dark ? Colors.white : Colors.grey[800],
+                        inactiveTrackColor:
+                            dark ? Colors.grey[900] : Colors.grey[400],
+                        thumbShape:
+                            RoundSliderThumbShape(enabledThumbRadius: 10.0),
+                        thumbColor: dark ? Colors.grey[200] : Colors.grey[800],
+                      ),
+                      child: Slider(
+                          value: volume,
+                          min: 0.0,
+                          max: 1.0,
+                          onChanged: (value) async {
+                            volume = value;
+
+                            await audioPlayer.setVolume(value);
+                          }),
+                    ),
+                    Spacer(
+                      flex: 1,
+                    ),
+                    FaIcon(FontAwesomeIcons.volumeUp,
+                        color: dark ? Colors.white : Colors.grey[700],
+                        size: 19),
+                    Spacer(
+                      flex: 2,
+                    ),
+                  ],
+                ),
+                Spacer(flex: 2),
+              ],
+            );
+          },
+          stream: _slider,
+          initialData: position.inMilliseconds.toDouble(),
+        ),
+      ),
+    );
+  }
+
   Widget _buildAudioTile(Audio audio) {
     return GestureDetector(
       onTap: () {
@@ -838,6 +1249,7 @@ class _MyHomePageState extends State<MyHomePage>
           _current = audio;
         });
         if (isPaused || isPlaying) {
+          debugPrint('stop tile');
           stop();
         }
         debugPrint('${audio.tempID}');
@@ -878,8 +1290,9 @@ class _MyHomePageState extends State<MyHomePage>
                                     : ColorFilter.mode(
                                         Colors.white.withOpacity(0.0),
                                         BlendMode.darken),
-                                child: Image.network(
-                                  audio.imageURL,
+                                child: FadeInImage.assetNetwork(
+                                  placeholder: 'images/music.jpg',
+                                  image: audio.imageURL,
                                   fit: BoxFit.cover,
                                 ),
                               )
@@ -892,7 +1305,7 @@ class _MyHomePageState extends State<MyHomePage>
                                         Colors.white.withOpacity(0.0),
                                         BlendMode.darken),
                                 child: Container(
-                                  color: dark ? Colors.black54 : Colors.black26,
+                                  color: dark ? Colors.black54 : Colors.black12,
                                   child: Center(
                                     child: Icon(Icons.music_note,
                                         color: dark
@@ -905,15 +1318,17 @@ class _MyHomePageState extends State<MyHomePage>
                       _current == audio
                           ? Center(
                               child: IconButton(
-                                icon: Icon(
-                                  isPlaying ? Icons.pause : Icons.play_arrow,
+                                icon: FaIcon(
+                                  isPlaying
+                                      ? FontAwesomeIcons.pause
+                                      : FontAwesomeIcons.play,
+                                  size: 14,
                                   color: dark
                                       ? Colors.white.withOpacity(0.9)
                                       : Colors.black.withOpacity(0.9),
                                 ),
-                                onPressed: isPlaying
-                                    ? () => pause()
-                                    : () => play(buildUrl(_current)),
+                                onPressed:
+                                    isPlaying ? () => pause() : () => resume(),
                               ),
                             )
                           : Container(),
